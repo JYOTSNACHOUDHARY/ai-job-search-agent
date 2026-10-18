@@ -6,6 +6,10 @@ Streamlit UI for the Europe Job Search Agent.
 
 import contextlib
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -17,6 +21,20 @@ import job_agent as agent
 st.set_page_config(page_title="Europe Job Search Agent", page_icon="🌍", layout="wide")
 
 ALL_COUNTRIES = [c[0] for c in agent.REST_OF_EUROPE]
+SAMPLE_DIR = Path(__file__).parent / "demo" / "output"
+
+# Hosted demo (Streamlit Community Cloud runs apps from /mount/src, Hugging Face sets SPACE_ID): every visitor
+# gets a private temporary folder and uses their own OpenAI key. Searches run in a separate process, so
+# visitors never share a profile, key or results.
+HOSTED = bool(os.getenv("JOB_AGENT_HOSTED") or os.getenv("SPACE_ID")
+              or str(Path(__file__).resolve()).startswith("/mount/src/"))
+if HOSTED:
+    if "home" not in st.session_state:
+        st.session_state.home = Path(tempfile.mkdtemp(prefix="job-agent-"))
+    HOME = st.session_state.home
+else:
+    HOME = agent.HOME_DIR
+OUTPUT_DIR, PROFILE_PATH = HOME / "output", HOME / "profile.json"
 COMPANY_TYPES = ["scaleup", "startup", "big_tech_international", "corporate", "consultancy",
                  "recruitment_agency", "unknown"]
 
@@ -42,26 +60,45 @@ class LiveLog:
 
 
 def list_runs():
-    if not agent.OUTPUT_DIR.exists():
-        return []
-    return sorted((p.parent.name for p in agent.OUTPUT_DIR.glob("*/results.json")), reverse=True)
+    """Run folders, newest first. The hosted demo adds the bundled sample run after the visitor's own runs."""
+    def runs(folder):
+        return sorted((str(p.parent) for p in folder.glob("*/results.json")), reverse=True)
+    return runs(OUTPUT_DIR) + (runs(SAMPLE_DIR) if HOSTED else [])
 
 
-def run_label(folder: str) -> str:
-    """'2026-10-13_0802' -> 'Run of 2026-10-13 08:02 · 57 jobs' (older folders are date-only)."""
-    date, _, hhmm = folder.partition("_")
+def run_label(run_dir: str) -> str:
+    """'.../2026-10-13_0802' -> 'Run of 2026-10-13 08:02 · 57 jobs' (older folders are date-only)."""
+    date, _, hhmm = Path(run_dir).name.partition("_")
     try:
-        count = len(json.loads((agent.OUTPUT_DIR / folder / "results.json").read_text())["jobs"])
+        count = len(json.loads((Path(run_dir) / "results.json").read_text())["jobs"])
     except Exception:
         count = "?"
-    return f"Run of {date}{' ' + hhmm[:2] + ':' + hhmm[2:] if hhmm else ''} · {count} jobs"
+    sample = "Sample run (a Senior AI Engineer's CV) · " if Path(run_dir).parent == SAMPLE_DIR else "Run of "
+    return f"{sample}{date}{' ' + hhmm[:2] + ':' + hhmm[2:] if hhmm else ''} · {count} jobs"
+
+
+def read_profile():
+    return json.loads(PROFILE_PATH.read_text()) if PROFILE_PATH.exists() else None
+
+
+def run_agent(args, log, api_key):
+    """Hosted mode: runs job_agent.py in the visitor's folder with the visitor's key, streaming its output."""
+    env = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+    env.update(OPENAI_API_KEY=api_key, JOB_AGENT_HOME=str(HOME), PYTHONUNBUFFERED="1")
+    proc = subprocess.Popen([sys.executable, "-u", agent.__file__, "--no-open", *map(str, args)], env=env,
+                            cwd=HOME, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for line in proc.stdout:
+        log.write(line)
+    if proc.wait():
+        raise RuntimeError(log.lines[-1] if log.lines else "the search process failed")
 
 
 @st.cache_data(show_spinner=False)
-def load_run(run_date: str, _mtime: float):
-    data = json.loads((agent.OUTPUT_DIR / run_date / "results.json").read_text())
-    # merge here too, so runs saved before cross-country de-duplication also look clean
-    df = pd.DataFrame(agent.merge_duplicates(data["jobs"], score=lambda r: r["rank_score"]))
+def load_run(run_dir: str, _mtime: float):
+    data = json.loads((Path(run_dir) / "results.json").read_text())
+    # re-score and merge here too, so runs saved before the latest ranking and de-duplication look the same
+    rows = [agent.rescore_saved(r) for r in data["jobs"] if not agent._TOO_JUNIOR.search(r.get("title") or "")]
+    df = pd.DataFrame(agent.merge_duplicates(rows, score=lambda r: r["rank_score"]))
     if not df.empty:
         df["country_label"] = df.apply(
             lambda r: r["country"] + (f"  (+ {', '.join(r['also_in'])})" if r.get("also_in") else ""), axis=1)
@@ -111,22 +148,35 @@ def results_table(df: pd.DataFrame, key: str):
 # Sidebar: profile + search settings
 # --------------------------------------------------------------------------------------
 
-profile = agent.load_profile()
+profile = read_profile()
+api_key = ""
 
 with st.sidebar:
+    if HOSTED:
+        st.header("0 · Your OpenAI key")
+        api_key = st.text_input("OpenAI API key", type="password", placeholder="sk-...",
+                                help="Needed to read your CV and score jobs. A search costs roughly "
+                                     "$0.05–0.30 on gpt-4.1-mini. The key stays in this browser session "
+                                     "and is never saved to disk.").strip()
     st.header("1 · Your profile")
     cv_file = st.file_uploader("CV (PDF, DOCX or TXT)", type=["pdf", "docx", "txt"],
                                help="Read once. Upload again only when your CV changes.")
-    if cv_file and st.button("Analyse CV", type="primary", width="stretch"):
-        agent.DATA_DIR.mkdir(exist_ok=True)
-        cv_path = agent.DATA_DIR / f"uploaded_cv{Path(cv_file.name).suffix.lower()}"
+    if cv_file and st.button("Analyse CV", type="primary", width="stretch", disabled=HOSTED and not api_key):
+        (HOME / "data").mkdir(parents=True, exist_ok=True)
+        cv_path = HOME / "data" / f"uploaded_cv{Path(cv_file.name).suffix.lower()}"
         cv_path.write_bytes(cv_file.getvalue())
         with st.spinner("Reading your CV ..."):
             try:
-                profile = agent.load_profile(cv_path)
+                if HOSTED:
+                    run_agent(["--cv", cv_path, "--profile-only"], LiveLog(st.empty()), api_key)
+                    profile = read_profile()
+                else:
+                    profile = agent.load_profile(cv_path)
                 st.success("Profile saved")
-            except SystemExit as e:  # unreadable / scanned PDF
+            except (SystemExit, RuntimeError) as e:  # unreadable / scanned PDF, bad key
                 st.error(str(e))
+    if HOSTED and cv_file and not api_key:
+        st.caption("Add your OpenAI key above to analyse the CV.")
 
     if profile:
         st.markdown(f"**{profile.get('name', '')}** · {profile.get('years_experience', '?')} yrs · "
@@ -138,17 +188,18 @@ with st.sidebar:
         new_terms = [t.strip() for t in terms.splitlines() if t.strip()]
         if new_terms != profile["search_terms"] and st.button("Save job titles", width="stretch"):
             profile["search_terms"] = new_terms
-            agent.save_profile(profile)
+            PROFILE_PATH.write_text(json.dumps(profile, indent=2, ensure_ascii=False))
             st.success("Saved - title variants will be refreshed on the next search")
         with st.expander(f"Titles that count as a match ({len(agent.match_phrases(profile))})"):
             st.caption("Your titles + AI-generated variants. Used to filter the smaller boards and career "
                        "pages; LinkedIn/Indeed/Glassdoor search your titles directly.")
             st.write(", ".join(agent.match_phrases(profile)))
     else:
-        st.info("Upload your CV to get started.")
+        st.info("Upload your CV to get started." + (" Meanwhile, browse the sample run →" if HOSTED else ""))
 
     st.header("2 · Search settings")
-    saved = agent.load_settings()
+    saved = agent.load_settings() if not HOSTED else {
+        **agent.DEFAULT_SETTINGS, "countries": ["United Kingdom", "Netherlands"], "results_per_query": 15}
     countries = st.multiselect("Countries besides Germany", ALL_COUNTRIES,
                                default=[c for c in saved["countries"] if c in ALL_COUNTRIES],
                                help="Germany is always searched. More countries = longer runs.")
@@ -168,32 +219,36 @@ with st.sidebar:
         n = len(json.loads(agent.COMPANIES_PATH.read_text())["companies"])
         st.caption(f"Career pages: {n} companies (edit companies.json to add your targets)")
     current = dict(countries=countries, sources=sources, hours=hours, results_per_query=per_query)
-    if current != {k: saved[k] for k in current} and st.button("Save as default settings", width="stretch"):
+    if not HOSTED and current != {k: saved[k] for k in current} and st.button("Save as default settings",
+                                                                               width="stretch"):
         agent.save_settings(**current)
         st.success("Saved - the daily run uses these")
     run_clicked = st.button(f"🔎 Find jobs from the last {hours // 24} day{'s' if hours > 24 else ''}",
-                            type="primary", width="stretch", disabled=not (profile and sources))
+                            type="primary", width="stretch",
+                            disabled=not (profile and sources and (api_key or not HOSTED)))
 
-    st.header("3 · Daily automatic run")
-    scheduled = agent.schedule_status()
-    if scheduled:
-        st.success(f"Runs every day at {scheduled} with the saved settings")
-        if agent.SCHEDULE_LOG.exists():
-            with st.expander("Last run log"):
-                st.code("\n".join(agent.SCHEDULE_LOG.read_text().splitlines()[-30:]), language=None)
-    when = st.time_input("Run every day at", value=pd.Timestamp(f"2000-01-01 {scheduled or '08:00'}").time(),
-                         step=900)
-    b1, b2 = st.columns(2)
-    if b1.button("Schedule" if not scheduled else "Update", width="stretch", disabled=not profile):
-        try:
-            st.toast(agent.install_schedule(when.hour, when.minute))
+if not HOSTED and sys.platform == "darwin":  # the daily run uses macOS launchd
+    with st.sidebar:
+        st.header("3 · Daily automatic run")
+        scheduled = agent.schedule_status()
+        if scheduled:
+            st.success(f"Runs every day at {scheduled} with the saved settings")
+            if agent.SCHEDULE_LOG.exists():
+                with st.expander("Last run log"):
+                    st.code("\n".join(agent.SCHEDULE_LOG.read_text().splitlines()[-30:]), language=None)
+        when = st.time_input("Run every day at", value=pd.Timestamp(f"2000-01-01 {scheduled or '08:00'}").time(),
+                             step=900)
+        b1, b2 = st.columns(2)
+        if b1.button("Schedule" if not scheduled else "Update", width="stretch", disabled=not profile):
+            try:
+                st.toast(agent.install_schedule(when.hour, when.minute))
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+        if scheduled and b2.button("Remove", width="stretch"):
+            st.toast(agent.remove_schedule())
             st.rerun()
-        except Exception as e:
-            st.error(str(e))
-    if scheduled and b2.button("Remove", width="stretch"):
-        st.toast(agent.remove_schedule())
-        st.rerun()
-    st.caption("If the Mac is asleep at that time, the run starts when it wakes up.")
+        st.caption("If the Mac is asleep at that time, the run starts when it wakes up.")
 
 
 # --------------------------------------------------------------------------------------
@@ -204,12 +259,23 @@ st.title("🌍 Europe Job Search Agent")
 st.caption("Fresh jobs across Germany, the UK and Europe - ranked by how likely "
            "the employer is to hire an international candidate who needs a visa and doesn't speak German.")
 
+if HOSTED:
+    st.info("**Live demo.** The sample run below was made for a Senior AI Engineer's CV, so you can try the "
+            "filters straight away. To search for yourself, add your OpenAI key and CV in the sidebar. Your CV, "
+            "profile and results go to a temporary folder only your session can see, and are wiped when the Space "
+            "restarts. For daily automatic runs, [run it on your own machine]"
+            "(https://github.com/JYOTSNACHOUDHARY/ai-job-search-agent).", icon="👋")
+
 if run_clicked:
-    with st.status("Searching ...", expanded=True) as status:
+    with st.status("Searching ... (usually 3–10 minutes)", expanded=True) as status:
         log = LiveLog(st.empty())
         try:
-            with contextlib.redirect_stdout(log):
-                agent.run_search(profile, sources, countries, per_query, hours)
+            if HOSTED:
+                run_agent(["--sources", *sources, "--countries", *countries, "--results-per-query", per_query,
+                           "--hours", hours], log, api_key)
+            else:
+                with contextlib.redirect_stdout(log):
+                    agent.run_search(profile, sources, countries, per_query, hours)
             status.update(label="Search finished", state="complete", expanded=False)
         except Exception as e:
             status.update(label=f"Search failed: {e}", state="error")
@@ -220,9 +286,9 @@ if not runs:
     st.info("No results yet. Upload your CV in the sidebar, then click **Find jobs**.")
     st.stop()
 
-run_date = st.selectbox("Results from", runs, index=0, label_visibility="collapsed",
-                        format_func=run_label)
-meta, jobs = load_run(run_date, (agent.OUTPUT_DIR / run_date / "results.json").stat().st_mtime)
+run_dir = st.selectbox("Results from", runs, index=0, label_visibility="collapsed", format_func=run_label)
+run_date = Path(run_dir).name
+meta, jobs = load_run(run_dir, (Path(run_dir) / "results.json").stat().st_mtime)
 if jobs.empty:
     st.warning("That run found no jobs.")
     st.stop()
@@ -234,11 +300,13 @@ with st.expander("Filters", expanded=True):
     types = c3.multiselect("Company type", COMPANY_TYPES, default=[],
                            placeholder="All types", format_func=lambda t: t.replace("_", " "))
     query = c4.text_input("Search title / company", placeholder="e.g. LLM, Zalando")
-    c5, c6, c7, c8 = st.columns(4)
+    c5, c6, c7, c8, c9 = st.columns(5)
     only_new = c5.toggle("🆕 Only new jobs", value=False, help="Hide jobs already shown in earlier runs")
     hide_no_visa = c6.toggle("Hide 'no visa sponsorship'", value=True)
     hide_lang = c7.toggle("Hide 'local language required'", value=False)
     hide_agencies = c8.toggle("Hide recruitment agencies", value=False)
+    hide_corporates = c9.toggle("Hide traditional corporates", value=False,
+                                help="Large non-tech companies (insurers, banks, retailers ...), which more often need German")
 
 f = jobs[(jobs.cv_fit >= min_fit) & (jobs.hiring_chance >= min_chance)]
 if types:
@@ -254,6 +322,8 @@ if hide_lang:
     f = f[f.local_language != "required"]
 if hide_agencies:
     f = f[f.company_type != "recruitment_agency"]
+if hide_corporates:
+    f = f[f.company_type != "corporate"]
 f = f.sort_values("rank_score", ascending=False)
 
 germany, rest = f[f.region == "Germany"], f[f.region != "Germany"]
@@ -282,7 +352,8 @@ Hiring chance starts at 50 and moves with what the ad and official registers say
 |---|---|
 | Visa sponsorship offered | +25 |
 | On UK / Netherlands official visa-sponsor register | +20 |
-| Scale-up / big international tech / startup | +15 / +12 / +10 |
+| Startup / scale-up / big international tech | +18 / +18 / +5 |
+| Traditional corporate / consultancy | −10 / −5 |
 | Ad in English · English working language · no local language needed | +10 · +10 · +12 |
 | Relocation support | +12 |
 | Ad in German | −25 |

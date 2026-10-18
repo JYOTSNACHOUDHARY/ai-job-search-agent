@@ -9,6 +9,8 @@ You upload your CV once. Every morning the agent searches 10 job sources, includ
 
 Each job shows a transparent score breakdown, so you can see *why* it ranked where it did.
 
+**▶ Try the live demo** (link coming soon). It opens with a sample run made for a Senior AI Engineer's CV, so you can explore the filters right away. To search with your own CV, paste your own OpenAI API key in the sidebar.
+
 ---
 
 ## Why this exists
@@ -22,12 +24,14 @@ Generic job boards rank jobs by keyword relevance. For a non-EU candidate, a per
 | UK Skilled Worker visa | Matches the employer against the **Home Office register of licensed sponsors** (~120k employers) |
 | Netherlands highly-skilled-migrant visa | Matches against the **IND public register of recognised sponsors** (~13k employers) |
 | Germany EU Blue Card | Any employer can sponsor, so the agent checks the stated salary against the 2026 threshold (€45,934 for IT roles / €50,700 standard) |
-| Company type | Scale-ups, international tech and startups get a boost; recruitment agencies get a small penalty |
+| Company type | Startups and scale-ups get the biggest boost, big international tech a small one; traditional corporates, consultancies and agencies get a penalty |
 
 ### What the research says
 
 - **Startups in Germany are English-friendly.** In a Bitkom survey of German tech startups, 59% no longer require German and 54% use English as the official company language. Across *all* German job ads, only ~2.7% state that German isn't needed.
-- **Scale-ups often beat early-stage startups for visa candidates.** They work in English too, but they also have the HR capacity, relocation budgets and salaries a visa process needs. The ranking reflects this: scale-up +15, international tech +12, startup +10. (This weighting is a judgement call, not a measured result.)
+- **Traditional corporates are the hardest door.** In the agent's own results, corporate ads required the local language about twice as often as startup and scale-up ads (44% vs 20%) and almost never mentioned visa support.
+- **Startups can sponsor too.** A German Blue Card needs no sponsor licence, so a 20-person startup can hire from India as easily as a corporate. In the UK and the Netherlands, the sponsor-register check catches startups that can't sponsor.
+- **Big tech sponsors, but everyone applies.** It gets a small boost only. The weights are startup +18, scale-up +18, big international tech +5, corporate −10, consultancy −5, agency −8. (They're a judgement call informed by the data above, not a measured result.)
 - **In the UK and Netherlands, the sponsor licence is decisive.** An employer that isn't on the register legally can't sponsor the visa, however good the match.
 
 ---
@@ -65,7 +69,8 @@ flowchart LR
 |---|---|
 | Visa sponsorship offered | **+25** |
 | On UK / NL official sponsor register | **+20** |
-| Scale-up / big international tech / startup | +15 / +12 / +10 |
+| Startup / scale-up / big international tech | +18 / +18 / +5 |
+| Traditional corporate / consultancy | −10 / −5 |
 | No local language needed | +12 |
 | Relocation support | +12 |
 | Ad in English / English working language | +10 / +10 |
@@ -216,6 +221,8 @@ job_search_agent/
 ├── job_agent.py      # the agent: CV → collect → evaluate → rank → report (also the CLI)
 ├── companies.json    # career pages to check - add your target companies
 ├── requirements.txt
+├── Dockerfile        # container for Hugging Face Spaces or any Docker host
+├── demo/output/      # sample run shown by the hosted demo
 ├── .env.example
 ├── profile.json      # your parsed CV, titles + variants    (git-ignored, created on first run)
 ├── settings.json     # saved search settings                (git-ignored)
@@ -229,6 +236,12 @@ job_search_agent/
 
 - Your CV, profile and results stay on your machine. They are git-ignored, so they won't be pushed to your repo.
 - CV text and job postings are sent to the OpenAI API for analysis.
+- **Hosted demo:** each visitor's CV, profile and results go to a temporary folder that only their browser session can see. The OpenAI key is kept in the session and passed to the search process, never written to disk. The hosting provider wipes the folders when the app restarts. Daily automatic runs are only available when you run the agent on your own Mac.
+
+## Deploy your own demo
+
+- **Streamlit Community Cloud (free):** fork this repo, go to [share.streamlit.io](https://share.streamlit.io), click **Create app**, choose your fork, set the main file to `app.py` and the Python version to 3.12 under *Advanced settings*. The app switches to hosted-demo mode by itself.
+- **Docker / Hugging Face Spaces:** the `Dockerfile` runs the same hosted mode on port 7860. (Hugging Face needs a PRO plan for Docker Spaces.)
 
 ## Limitations & responsible use
 

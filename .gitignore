@@ -1,7 +1,7 @@
-profile.json
-settings.json
-data/
-output/
+/profile.json
+/settings.json
+/data/
+/output/
 __pycache__/
 .env
 run.log

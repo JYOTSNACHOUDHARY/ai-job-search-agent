@@ -42,6 +42,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
@@ -49,16 +50,20 @@ import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv(override=True)
+# JOB_AGENT_HOME moves all personal files (profile, settings, results, caches) to another folder.
+# The hosted demo gives every visitor their own folder and their own API key, which a .env must not override.
+HOME_DIR = Path(os.environ["JOB_AGENT_HOME"]) if os.getenv("JOB_AGENT_HOME") else None
+load_dotenv(override=HOME_DIR is None)
 
 HERE = Path(__file__).parent
-DATA_DIR = HERE / "data"
-OUTPUT_DIR = HERE / "output"
-PROFILE_PATH = HERE / "profile.json"
+HOME_DIR = HOME_DIR or HERE
+DATA_DIR = HOME_DIR / "data"
+OUTPUT_DIR = HOME_DIR / "output"
+PROFILE_PATH = HOME_DIR / "profile.json"
 EVAL_CACHE_PATH = DATA_DIR / "evaluations_cache.json"
 SEEN_PATH = DATA_DIR / "seen_jobs.json"
 COMPANIES_PATH = HERE / "companies.json"
-SETTINGS_PATH = HERE / "settings.json"
+SETTINGS_PATH = HOME_DIR / "settings.json"
 
 MODEL = os.getenv("JOB_AGENT_MODEL", "gpt-4.1-mini")
 MIN_FIT = int(os.getenv("JOB_AGENT_MIN_FIT", "45"))  # hide jobs that don't match the CV
@@ -706,8 +711,13 @@ def _phrase_regex(phrases: tuple):
     return re.compile(r"(?<![a-z0-9])(?:" + alternatives + r")(?![a-z0-9])")
 
 
+_TOO_JUNIOR = re.compile(r"\b(junior|jr\.?|intern|internship|werkstudent\w*|working student|praktik\w*|"
+                         r"trainee|graduate|thesis|abschlussarbeit|masterarbeit|bachelorarbeit|ausbildung)\b", re.I)
+
+
 def is_relevant(title: str, profile) -> bool:
-    return bool(_phrase_regex(tuple(match_phrases(profile))).search((title or "").lower()))
+    title = (title or "").lower()
+    return not _TOO_JUNIOR.search(title) and bool(_phrase_regex(tuple(match_phrases(profile))).search(title))
 
 
 VARIANTS_PROMPT = """You help a job seeker search European job boards.
@@ -744,12 +754,19 @@ def _days(hours: int) -> int:
     return max(1, -(-hours // 24))  # ceil
 
 
+def _ascii(text: str) -> str:
+    text = (text or "").lower().replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+
+
 def _norm_company(name: str) -> str:
-    name = (name or "").lower()
-    name = re.sub(r"\bt/a\b.*", "", name)
+    """'Siemens Energy Global GmbH & Co. KG' and 'Siemens Energy' -> 'siemens energy'."""
+    name = _ascii(name)
+    name = re.sub(r"\bt/a\b.*|\bstandort\b.*|\.com\b", "", name)
     name = re.sub(r"[^a-z0-9 ]", " ", name)
-    name = re.sub(r"\b(ltd|limited|plc|llp|llc|inc|gmbh|ag|se|bv|b v|nv|n v|uk|group|holdings?|"
-                  r"europe|international|co|company|the)\b", " ", name)
+    name = re.sub(r"\b(ltd|limited|plc|llp|llc|inc|gmbh|mbh|ag|kg|kgaa|vvag|se|bv|b v|nv|n v|uk|group|holdings?|"
+                  r"europe|international|global|germany|deutschland|dienstleistungen|investors|"
+                  r"co|company|the)\b", " ", name)
     return re.sub(r"\s+", " ", name).strip()
 
 
@@ -761,9 +778,17 @@ _PLACES_RE = re.compile(r"\b(?:in\s+|-\s*)?(?:" + "|".join(map(re.escape, _PLACE
 
 
 def _norm_title(title: str) -> str:
-    """'Data Engineer (m/w/d) in Hamburg' and 'Data Engineer (all genders) Berlin' -> 'data engineer'."""
-    t = _PLACES_RE.sub(" ", _GENDER_TAGS.sub(" ", (title or "").lower()))
+    """'Data Engineer (m/w/d) in Hamburg' and 'Data Engineer (all genders) Berlin' -> 'data engineer'.
+    German ads put extras after the gender tag ('(m/w/d), Würzburg', '(m/w/d) (Data Scientist)'),
+    so everything after it is dropped, as are reference codes like 'E362/B - '."""
+    t = (title or "").lower()
+    tag = _GENDER_TAGS.search(t)
+    if tag and tag.start() > 0:
+        t = t[:tag.start()]
+    t = re.sub(r"^\s*[a-z]{0,3}\d+[a-z0-9/._-]*\s*[-–:|]\s*", "", t)
+    t = _PLACES_RE.sub(" ", _GENDER_TAGS.sub(" ", t))
     t = re.sub(r"[^a-z0-9äöüß+# ]", " ", t)
+    t = re.sub(r"\b(senior|sr)\b", " ", t)  # 'Data Scientist' and 'Senior Data Scientist' at one company: apply once
     return re.sub(r"\s+", " ", t).strip()
 
 
@@ -801,15 +826,13 @@ def _seen_key(job) -> str:
 
 def mark_new(jobs):
     """Flags jobs never shown in any earlier run. data/seen_jobs.json maps job key -> first seen.
-    On first use it is seeded from earlier runs' results, so old jobs aren't flagged as new."""
-    if SEEN_PATH.exists():
-        seen = json.loads(SEEN_PATH.read_text())
-    else:
-        seen = {}
-        for path in sorted(OUTPUT_DIR.glob("*/results.json")):
-            data = json.loads(path.read_text())
-            for j in data["jobs"]:
-                seen.setdefault(_seen_key(j), data["meta"].get("created", ""))
+    Earlier runs' results are always included, so old jobs aren't flagged as new."""
+    seen = json.loads(SEEN_PATH.read_text()) if SEEN_PATH.exists() else {}
+    # Also re-key earlier runs' jobs every time, so improving _seen_key never makes old jobs look new
+    for path in sorted(OUTPUT_DIR.glob("*/results.json")):
+        data = json.loads(path.read_text())
+        for j in data["jobs"]:
+            seen.setdefault(_seen_key(j), data["meta"].get("created", ""))
     now = dt.datetime.now().isoformat(timespec="minutes")
     for job in jobs:
         key = _seen_key(job)
@@ -933,6 +956,29 @@ def evaluate_jobs(jobs, profile, client):
 # 5. Ranking - "how likely is this employer to hire a non-German-speaking Indian candidate"
 # --------------------------------------------------------------------------------------
 
+# Startups and scale-ups get the biggest boost. In this agent's own results, traditional corporates
+# required the local language about twice as often (44% vs 20%) and almost never mentioned visa
+# support, and Bitkom finds most German tech startups work in English. Big tech does sponsor, but every
+# applicant in the world applies there, so it only gets a small boost. In Germany a Blue Card needs no
+# sponsor licence, so a small startup can hire from India as easily as a corporate; in the UK/NL the
+# sponsor-register check below catches startups that can't sponsor.
+COMPANY_POINTS = {"startup": 18, "scaleup": 18, "big_tech_international": 5,
+                  "corporate": -10, "consultancy": -5, "recruitment_agency": -8}
+_COMPANY_LABELS = {"startup", "scaleup", "big tech international", "corporate", "consultancy", "recruitment agency"}
+
+
+def rescore_saved(row):
+    """Re-applies the current COMPANY_POINTS to a job saved by an earlier run, using its signals list."""
+    signals = [s for s in row.get("signals") or [] if s.split(" ", 1)[-1] not in _COMPANY_LABELS]
+    ctype = row.get("company_type")
+    if COMPANY_POINTS.get(ctype):
+        points = COMPANY_POINTS[ctype]
+        signals.append(f"{'+' if points > 0 else ''}{points} {ctype.replace('_', ' ')}")
+    chance = max(0, min(100, 50 + sum(int(s.split(" ", 1)[0]) for s in signals)))
+    return {**row, "signals": signals, "hiring_chance": chance,
+            "rank_score": round(0.55 * chance + 0.45 * (row.get("cv_fit") or 0), 1)}
+
+
 def international_score(job, sponsors):
     """Rule-based, explainable score 0-100. Returns (score, list of signals)."""
     e, score, signals = job["eval"], 50, []
@@ -968,14 +1014,10 @@ def international_score(job, sponsors):
     if e.get("remote_restricted_to_residents"):
         add(-20, "remote for residents only")
 
-    # Company type - startups/scaleups default to English (Bitkom: 54% of German tech startups
-    # use English as company language, 59% don't require German). Scaleups have the HR capacity
-    # for visa paperwork, early startups sometimes don't. Agencies rarely place visa candidates.
+    # Company type - see COMPANY_POINTS
     ctype = e.get("company_type")
-    company_points = {"scaleup": 15, "startup": 10, "big_tech_international": 12,
-                      "consultancy": -3, "recruitment_agency": -8}
-    if ctype in company_points:
-        add(company_points[ctype], ctype.replace("_", " "))
+    if COMPANY_POINTS.get(ctype):
+        add(COMPANY_POINTS[ctype], ctype.replace("_", " "))
 
     # Country-specific legal reality
     country = job["country"]
@@ -1292,6 +1334,7 @@ def main():
     parser.add_argument("--schedule", metavar="HH:MM", help="run automatically every day at this time")
     parser.add_argument("--unschedule", action="store_true", help="remove the daily run")
     parser.add_argument("--no-open", action="store_true", help="don't open the report in the browser")
+    parser.add_argument("--profile-only", action="store_true", help="only read the CV (--cv) and save profile.json")
     args = parser.parse_args()
 
     if args.unschedule:
@@ -1303,6 +1346,8 @@ def main():
     profile = load_profile(args.cv)
     if profile is None:
         raise SystemExit("First run: pass your CV, e.g.  --cv ~/Documents/cv.pdf")
+    if args.profile_only:
+        return print("   Profile saved")
     print(f"=== {dt.datetime.now():%Y-%m-%d %H:%M} ===")
     _, out_dir = run_search(profile, args.sources, args.countries, args.results_per_query, args.hours)
     if not args.no_open:
