@@ -301,7 +301,9 @@ with st.expander("Filters", expanded=True):
                            placeholder="All types", format_func=lambda t: t.replace("_", " "))
     query = c4.text_input("Search title / company", placeholder="e.g. LLM, Zalando")
     c5, c6, c7, c8, c9 = st.columns(5)
-    only_new = c5.toggle("🆕 Only new jobs", value=False, help="Hide jobs already shown in earlier runs")
+    only_new = c5.toggle("🆕 Only new jobs", value=True,
+                         help="Runs cover 48 hours, so about half of each run repeats yesterday's jobs. "
+                              "Turn off to see everything in this run.")
     hide_no_visa = c6.toggle("Hide 'no visa sponsorship'", value=True)
     hide_lang = c7.toggle("Hide 'local language required'", value=False)
     hide_agencies = c8.toggle("Hide recruitment agencies", value=False)

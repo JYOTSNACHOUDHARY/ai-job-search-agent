@@ -40,6 +40,7 @@ import html
 import io
 import json
 import os
+import random
 import re
 import time
 import unicodedata
@@ -208,27 +209,38 @@ def _row(source, region, country, title, company, location, url, description, po
 
 
 def collect_jobspy(search_terms, countries, region, results_per_query, hours=24):
-    """LinkedIn + Indeed via python-jobspy (no login, public job pages)."""
+    """LinkedIn + Indeed via python-jobspy (no login, public job pages).
+    LinkedIn throttles hard (HTTP 429). Fetching every job page during the search used ~28 requests
+    per search and got most searches cut off, so LinkedIn is searched without descriptions (about 1
+    request per 10 jobs, so twice as many results fit) and fill_linkedin_descriptions() then fetches
+    only the jobs that haven't been evaluated before, slowly."""
     from jobspy import scrape_jobs
 
     rows = []
     for name, linkedin_loc, indeed_country in countries:
         for term in search_terms:
-            try:
-                df = scrape_jobs(
-                    site_name=["linkedin", "indeed"],
-                    search_term=term,
-                    location=linkedin_loc,
-                    country_indeed=indeed_country,
-                    hours_old=hours,
-                    results_wanted=results_per_query,
-                    fetch_description=True,
-                    description_format="markdown",
-                    verbose=0,
-                )
-            except Exception as e:  # one failing query must not kill the run
-                print(f"   ! {name} / {term}: {e}")
+            frames = []
+            for site, wanted, describe in (("indeed", results_per_query, True),
+                                           ("linkedin", results_per_query * 2, False)):
+                try:
+                    frames.append(scrape_jobs(
+                        site_name=[site],
+                        search_term=term,
+                        location=linkedin_loc,
+                        country_indeed=indeed_country,
+                        hours_old=hours,
+                        results_wanted=wanted,
+                        fetch_description=describe,
+                        description_format="markdown",
+                        verbose=0,
+                    ))
+                except Exception as e:  # one failing query must not kill the run
+                    print(f"   ! {name} / {term} / {site}: {e}")
+            frames = [f for f in frames if len(f)]
+            if not frames:
+                print(f"   {name:<15} {term:<35}   0 jobs")
                 continue
+            df = pd.concat(frames, ignore_index=True)
             for _, j in df.iterrows():
                 salary = None
                 if str(j.get("currency", "")).upper() == "EUR" and pd.notna(j.get("min_amount")):
@@ -243,9 +255,47 @@ def collect_jobspy(search_terms, countries, region, results_per_query, hours=24)
                     company_size=j.get("company_num_employees") if pd.notna(j.get("company_num_employees", None)) else "",
                     salary_eur=salary,
                 ))
-            print(f"   {name:<15} {term:<35} {len(df):>3} jobs")
-            time.sleep(2)  # be polite - LinkedIn rate-limits aggressive scraping
+            counts = df["site"].value_counts() if len(df) else {}
+            print(f"   {name:<15} {term:<35} {counts.get('linkedin', 0):>3} LinkedIn {counts.get('indeed', 0):>3} Indeed")
+            time.sleep(random.uniform(4, 8))  # be polite - LinkedIn rate-limits aggressive scraping
     return rows
+
+
+def fill_linkedin_descriptions(jobs):
+    """Fetches the description of LinkedIn jobs not evaluated before, one page every few seconds.
+    On a 429 it waits and retries once, then stops: those jobs are evaluated from the title and
+    re-tried on the next run (evaluations without a description aren't cached)."""
+    from bs4 import BeautifulSoup
+
+    cache = _load_eval_cache()
+    todo = [j for j in jobs if j["source"] == "Linkedin" and not j["description"] and j["url"] not in cache]
+    if not todo:
+        return jobs
+    print(f"   Fetching {len(todo)} new LinkedIn job descriptions (slowly, to avoid LinkedIn's rate limit) ...")
+    session, fetched = requests.Session(), 0
+    session.headers.update({"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"})
+    for job in todo:
+        job_id = re.search(r"/jobs/view/(?:[^/?]*-)?(\d+)", job["url"])
+        if not job_id:
+            continue
+        for attempt in range(2):
+            try:
+                r = session.get(f"https://www.linkedin.com/jobs/view/{job_id.group(1)}", timeout=30)
+            except Exception:
+                break
+            if r.status_code != 429:
+                break
+            time.sleep(90)
+        else:
+            print(f"   ! LinkedIn is throttling - {len(todo) - fetched} descriptions left for the next run")
+            return jobs
+        div = BeautifulSoup(r.text, "html.parser").find("div", class_="show-more-less-html__markup")
+        if div:
+            job["description"] = div.get_text("\n", strip=True)
+            fetched += 1
+        time.sleep(random.uniform(2, 4))
+    print(f"   Got {fetched} of {len(todo)} LinkedIn descriptions")
+    return jobs
 
 
 def collect_arbeitnow(profile, hours=24):
@@ -340,9 +390,12 @@ def collect_bundesagentur(profile, hours=24):
     job listings on make-it-in-germany.com. Biggest German board; many ads are in German,
     which the ranking will push down."""
     api = "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v6/jobs"
+    # The API ignores `veroeffentlichtseit` (2 days and 30 days return the same jobs, median age ~4 weeks),
+    # so every page is read and the window is applied to the first-publication date here.
+    since = (dt.datetime.now() - dt.timedelta(hours=hours)).date().isoformat()
     found = {}
     for phrase in search_phrases(profile):
-        for page in range(1, 4):
+        for page in range(1, 11):
             try:
                 r = requests.get(api, headers={**HTTP_HEADERS, "X-API-Key": "jobboerse-jobsuche"},
                                  params={"was": phrase, "veroeffentlichtseit": _days(hours), "angebotsart": 1,
@@ -353,7 +406,8 @@ def collect_bundesagentur(profile, hours=24):
                 break
             results = r.json().get("ergebnisliste") or []
             for j in results:
-                if is_relevant(j.get("stellenangebotsTitel", ""), profile):
+                if ((j.get("datumErsteVeroeffentlichung") or "") >= since
+                        and is_relevant(j.get("stellenangebotsTitel", ""), profile)):
                     found[j.get("referenznummer") or j.get("refnr")] = j
             if len(results) < 100:
                 break
@@ -939,16 +993,18 @@ def evaluate_jobs(jobs, profile, client):
                     return key, None
                 time.sleep(3 * (attempt + 1))
 
+    results = {}
     with cf.ThreadPoolExecutor(max_workers=8) as pool:
-        for i, (key, result) in enumerate(pool.map(evaluate, jobs), 1):
-            if result:
+        for i, (job, (key, result)) in enumerate(zip(jobs, pool.map(evaluate, jobs)), 1):
+            results[key] = result
+            if result and job["description"]:  # title-only evaluations are retried next run
                 cache[key] = result
             if i % 25 == 0:
                 print(f"   evaluated {i}/{len(jobs)}")
 
     EVAL_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False))
     for job in jobs:
-        job["eval"] = cache.get(job["url"] or f'{job["company"]}|{job["title"]}')
+        job["eval"] = results.get(job["url"] or f'{job["company"]}|{job["title"]}')
     return [j for j in jobs if j["eval"]]
 
 
@@ -1220,7 +1276,7 @@ def run_search(profile, sources=SOURCES, countries=None, results_per_query=25, h
             jobs += collectors[name]()
         except Exception as e:  # a site changing its layout must not kill the whole run
             print(f"   ! {name} failed: {e}")
-    jobs = deduplicate(jobs)
+    jobs = fill_linkedin_descriptions(deduplicate(jobs))
     print(f"   {len(jobs)} unique jobs")
 
     print("2. Loading official visa-sponsor registers ...")
